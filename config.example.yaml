@@ -1,0 +1,29 @@
+# config.example.yaml — template (committed). Copy to config.yaml and fill
+# real keys; config.yaml is gitignored and NEVER committed.
+# Shape per shared/LLM_PROVIDERS.md.
+
+default_provider: mimo          # or minimax
+
+providers:
+  mimo:
+    base_url: https://api.xiaomimimo.com/v1
+    api_key: FILL_IN_CONFIG_YAML   # real key in config.yaml only
+    tiers:
+      low:    { model: mimo-v2.5-pro-ultraspeed }
+      medium: { model: mimo-v2.5-pro-ultraspeed }
+      high:   { model: mimo-v2.5-pro-ultraspeed }
+  minimax:
+    base_url: https://gpt-agent.cc/v1
+    api_key: FILL_IN_CONFIG_YAML   # real key in config.yaml only
+    tiers:
+      low:    { model: MiniMax-M2.7-highspeed }   # case-sensitive
+      medium: { model: MiniMax-M2.7-highspeed }
+      high:   { model: MiniMax-M2.7-highspeed }
+
+# Cross-vendor judging guard: the judge MUST be a different vendor from the
+# SUT. Canonical pair: SUT=mimo, judge=minimax.
+judge:
+  provider: minimax
+  tier: medium
+
+# Repo-specific settings: add below as needed (e.g. db paths, demo params).
