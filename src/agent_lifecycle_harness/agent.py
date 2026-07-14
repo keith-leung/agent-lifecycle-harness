@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, MessagesState, StateGraph
 
@@ -15,11 +16,25 @@ from agent_lifecycle_harness.llm import LLMClient, LLMResponse
 from agent_lifecycle_harness.compaction import CompactionStore, CheckpointCompactor
 
 
-def _build_graph(llm_client: LLMClient) -> StateGraph:
+def _build_graph(llm_client: LLMClient, compaction_store: Any | None = None) -> StateGraph:
     """Minimal single-node agent graph for lifecycle experiments."""
 
-    def _call_model(state: MessagesState) -> dict[str, Any]:
+    def _call_model(state: MessagesState, config: RunnableConfig) -> dict[str, Any]:
         messages = state["messages"]
+        
+        # Read compaction digests from the store inside the graph node.
+        # This makes compaction a first-class graph concern rather than a
+        # harness-layer side effect.
+        prefix = ""
+        if compaction_store is not None:
+            thread_id = config.get("configurable", {}).get("thread_id", "")
+            digests = compaction_store.digests_for_thread(thread_id)
+            if digests:
+                digest_text = "\n".join(
+                    f"[DIGEST {d.digest_id}]: {d.summary}" for d in digests
+                )
+                prefix = f"Context digests:\n{digest_text}\n\n"
+        
         # Some providers (e.g. MiMo) reject `role: system`. Strip it here.
         filtered = []
         for m in messages:
@@ -27,6 +42,15 @@ def _build_graph(llm_client: LLMClient) -> StateGraph:
             if role == "system":
                 continue
             filtered.append(m)
+        
+        # Inject digest context into the first message if present.
+        if prefix and filtered:
+            first = filtered[0]
+            if hasattr(first, "content"):
+                first.content = f"{prefix}{first.content}"
+            elif isinstance(first, dict):
+                first["content"] = f"{prefix}{first.get('content', '')}"
+        
         response: LLMResponse = llm_client.invoke_sync(filtered)
         return {"messages": [AIMessage(content=response.content)]}
 
@@ -62,7 +86,7 @@ class LifecycleHarness:
         self.compaction_store = compaction_store
         self.compaction_threshold = compaction_threshold
         conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        self._graph = _build_graph(llm).compile(
+        self._graph = _build_graph(llm, self.compaction_store).compile(
             checkpointer=SqliteSaver(conn)
         )
         # Per-thread serialization locks (same-thread writers serialize).
@@ -88,19 +112,7 @@ class LifecycleHarness:
 
     def _build_inputs(self, thread_id: str, user_msg: str, *, truncate_after: int | None = None) -> dict[str, Any]:
         """Build inputs for the graph, optionally truncating history."""
-        # Inject digest context as a user-visible prefix if compaction store
-        # has digests for this thread. We avoid `role: system` because some
-        # providers (e.g. MiMo) reject it.
-        prefix = ""
-        if self.compaction_store:
-            digests = self.compaction_store.digests_for_thread(thread_id)
-            if digests:
-                digest_text = "\n".join(
-                    f"[DIGEST {d.digest_id}]: {d.summary}" for d in digests
-                )
-                prefix = f"Context digests:\n{digest_text}\n\n"
-        
-        user_message = {"role": "user", "content": f"{prefix}{user_msg}"}
+        user_message = {"role": "user", "content": user_msg}
         
         if truncate_after is not None and truncate_after > 0:
             # Get current state and truncate
@@ -110,13 +122,6 @@ class LifecycleHarness:
                 # Keep only the last truncate_after messages
                 if len(messages) > truncate_after:
                     messages = messages[-truncate_after:]
-                # Prepend digest context to the first message if present
-                if prefix and messages:
-                    first_msg = messages[0]
-                    if hasattr(first_msg, "content"):
-                        first_msg.content = f"{prefix}{first_msg.content}"
-                    elif isinstance(first_msg, dict):
-                        first_msg["content"] = f"{prefix}{first_msg.get('content', '')}"
                 return {"messages": messages + [user_message]}
         
         return {"messages": [user_message]}

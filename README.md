@@ -250,7 +250,7 @@ Maps A1-A6 lifecycle boundaries to OpenAI Agents SDK equivalents. Each OAI-side 
 | A3 | BaseStore provenance + soft tombstone + DAG traversal | Session.pop_item (removes provenance, no tombstone) | provenance DAG + audit log | opaque run records | provenance + tombstone + rerun (both) | `openai.agents.Session.pop_item` |
 | A4 | config-version tracker per thread_id | RunConfig (request-scoped, framework-given) | version tracker + session registration | thread_id / Session | config version mapping (LG only) | `openai.agents.RunConfig` |
 | A5 | invoke instrumentation + threshold alerting | run metrics + alerting hooks (framework-given) | DegradationMonitor | execution trace | metrics + alerts (both) | `openai.agents.Run metrics` |
-| A6 | state schema registry + migration fn | run schema versioning (framework-given) | SchemaRegistry | serialized state blob | schema + migration fn (both) | `openai.agents.Schema versioning` |
+| A6 | state schema registry + migration fn | none (app-owned migration; `trace_metadata` is arbitrary metadata, not a versioning API) | SchemaRegistry | `RunConfig.trace_metadata` slot exists (arbitrary user dict) | schema + migration fn (BOTH LG and OAI) | `agents.RunConfig.trace_metadata` (arbitrary metadata, NOT a versioning API) |
 
 **Key reference points:**
 - OAI's `OpenAIResponsesCompactionSession` is framework-given (LG side is app-owned)
@@ -280,6 +280,18 @@ I intentionally used LangGraph for checkpoint/store primitives and OpenAI Agents
 | Config hot-reload (version-on-session) | OAI SDK `RunConfig` (request-scoped, framework-given); LangGraph (no hot-reload protocol) | **Use OAI SDK where given; build on LG** |
 | Reasoning-degradation monitoring | AgentOps/LangSmith/Arize (tracing/eval, not in-loop auto-mitigation); no framework ships judge-based drift detection | **Build** — universally application-owned |
 | State-schema migration | No framework ships transactional agent-state migration | **Build** — universally application-owned |
+
+## Architecture Decisions
+
+**LangGraph StateGraph over hand-written loop.** LangGraph already provides checkpoint persistence, `thread_id` isolation, and time-travel via `get_state_history`. Building on top of it lets this harness focus on the layers frameworks do not ship: compaction policy, tombstone semantics, and schema migration. A hand-written loop would reimplement checkpointing and still lack these lifecycle primitives.
+
+**Compaction: first-N/last-N + middle-digest over sliding window.** A fixed first/last window preserves the head and tail of the conversation with full fidelity, which is what users and downstream turns actually rely on. A sliding window would evict either the start or the end, destroying anchors that later turns reference. The middle segment is compressed into one digest because middle turns are the most likely to be stale and the cheapest to summarize.
+
+**Soft-delete tombstone over hard-delete.** Hard-deleting a poisoned checkpoint breaks the provenance DAG and makes it impossible to answer "what was the input that produced this bad output?" during post-mortems. Soft-delete preserves the original record for audit, supports DAG traversal to find downstream victims, and allows recovery once the root cause is fixed.
+
+**Degradation detector tested on fixture sequences, not real degradation.** The detector is a pure function of score sequences; its correctness does not depend on whether an LLM actually degrades under truncation. Testing with hand-crafted fixtures removes noise from model variance, network flakiness, and prompt sensitivity, and lets us prove the detector fires exactly when sustained-delta conditions are met and stays silent on stable or single-dip sequences.
+
+**A8 build-vs-buy is documented in the table above.** Compaction, tombstone, degradation monitoring, and migration are universally application-owned because no current framework ships them. Thread isolation and request-scoped config are framework-given and reused rather than rebuilt.
 
 ## Keywords
 

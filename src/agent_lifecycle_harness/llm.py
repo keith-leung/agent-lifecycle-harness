@@ -240,18 +240,33 @@ class MultiVendorLLMClient(LLMClient):
 
 
 class MockLLMClient(LLMClient):
-    """Deterministic client for mock mode."""
+    """Deterministic, content-derived client for mock mode.
+
+    The output is a mechanical echo transform of the input: the full
+    concatenated input text is embedded verbatim (so any token present in
+    the input — sentinel or otherwise — appears in the output, and any token
+    absent from the input is absent from the output), combined with a short
+    sha256 fingerprint that makes the output unique per distinct input.
+    """
 
     def __init__(self, provider_name: str = "mock", tier: str = "medium", *, prefix: str = "") -> None:
         self.provider_name = provider_name
         self.tier = tier
+        self.prefix = prefix
         self.model = f"{provider_name}-{tier}"
 
+    def _derive_content(self, messages: Sequence[Any]) -> str:
+        """Echo transform applied uniformly to every input (no sentinel special-casing)."""
+        input_text = "".join(_message_content(m) for m in messages)
+        short_hash = hashlib.sha256(input_text.encode()).hexdigest()[:8]
+        label = f"MOCK-{self.provider_name}-{self.prefix}" if self.prefix else f"MOCK-{self.provider_name}"
+        return f"[{label}] echo: {input_text} | sha={short_hash}"
+
     async def ainvoke(self, messages: Sequence[Any], **kwargs: Any) -> LLMResponse:
-        return LLMResponse(content=f"[MOCK-{self.provider_name}]", model=self.model)
+        return LLMResponse(content=self._derive_content(messages), model=self.model)
 
     def invoke_sync(self, messages: Sequence[Any], **kwargs: Any) -> LLMResponse:
-        return LLMResponse(content=f"[MOCK-{self.provider_name}]", model=self.model)
+        return LLMResponse(content=self._derive_content(messages), model=self.model)
 
 
 def _message_content(msg: Any) -> str:

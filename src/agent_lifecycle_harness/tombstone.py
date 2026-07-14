@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from agent_lifecycle_harness.provenance import (
     ProvenanceRecord,
@@ -64,10 +64,15 @@ def tombstone_items_matching(
     *,
     rerun_downstream: bool = True,
     actor: str = "test",
+    rerun_fn: Callable[[str, str], dict[str, Any]] | None = None,
 ) -> TombstoneReport:
     """Find matching poisoned entries, mark them, and optionally re-run downstream.
 
     This is the hook D can call. A implements this; A does NOT implement D's registry.
+
+    If `rerun_fn` is provided, it is called for each affected checkpoint id and
+    must return a dict describing the rerun outcome. Otherwise a placeholder
+    ``{"status": "needs_rerun"}`` is recorded.
     """
     records = provenance.list_provenance_by_thread(thread_id)
     matches = [r for r in records if predicate(r)]
@@ -93,7 +98,10 @@ def tombstone_items_matching(
     rerun_outcomes: dict[str, Any] = {}
     if rerun_downstream:
         for cid in affected:
-            rerun_outcomes[cid] = {"status": "needs_rerun", "poison_ancestor": poisoned_id}
+            if rerun_fn is not None:
+                rerun_outcomes[cid] = rerun_fn(cid, thread_id)
+            else:
+                rerun_outcomes[cid] = {"status": "needs_rerun", "poison_ancestor": poisoned_id}
 
     audit.rerun_outcomes = rerun_outcomes
     return TombstoneReport(

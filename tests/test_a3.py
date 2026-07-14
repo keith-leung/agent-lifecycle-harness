@@ -18,7 +18,7 @@ def test_a3_all_assertions_pass_mock():
     names = {a.name for a in result.assertions}
     expected = {
         "dag_traversal_finds_affected",
-        "rerun_differs",
+        "rerun_poison_removed",
         "tombstone_soft",
         "audit_log_has_op_actor_ts",
     }

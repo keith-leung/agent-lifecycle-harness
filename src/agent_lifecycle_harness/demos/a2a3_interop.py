@@ -17,6 +17,7 @@ from agent_lifecycle_harness.compaction import CheckpointCompactor, CompactionSt
 from agent_lifecycle_harness.llm import LLMClient, MockLLMClient, RealLLMClient
 from agent_lifecycle_harness.provenance import ProvenanceStore, build_provenance_record
 from agent_lifecycle_harness.tombstone import TombstoneReport, tombstone_items_matching
+from agent_lifecycle_harness.demos.a3_tombstone import _rerun_checkpoint
 
 
 @dataclass
@@ -50,8 +51,25 @@ def _build_provenance_for_thread(
     thread_id: str,
     model_tag: str = "mock",
 ) -> ProvenanceStore:
+    """Build a provenance DAG from an existing thread's checkpoint history.
+
+    Only include checkpoints that contain at least one assistant message,
+    so the DAG represents complete turns rather than intermediate snapshots.
+    """
     store = ProvenanceStore(base_store=None)
-    checkpoints = harness.list_checkpoints(thread_id)
+    # list_checkpoints returns reverse-chronological (newest first).
+    # Reverse to chronological so parent = older checkpoint, child = newer.
+    raw_checkpoints = list(reversed(harness.list_checkpoints(thread_id)))
+
+    def _has_assistant(cp: dict[str, Any]) -> bool:
+        messages = cp.get("values", {}).get("messages", [])
+        if not messages:
+            return False
+        last = messages[-1]
+        role = getattr(last, "type", getattr(last, "role", ""))
+        return role in ("assistant", "ai")
+
+    checkpoints = [cp for cp in raw_checkpoints if _has_assistant(cp)]
     parent_ids: list[str] = []
     for i, cp in enumerate(checkpoints):
         cp_id = cp.get("checkpoint_id") or f"{thread_id}-cp-{i}"
@@ -97,37 +115,70 @@ def assert_digest_identified_as_affected(
     )
 
 
-def assert_rerun_produces_poison_free_output(
-    report: TombstoneReport,
-    poisoned_id: str,
-) -> AssertionResult:
-    """Re-run of affected turns should not derive from the poisoned checkpoint."""
-    # In CI-MOCK we verify the report records rerun outcomes for affected ids.
-    if not report.affected_downstream:
-        return AssertionResult(
-            name="rerun_produces_poison_free_output",
-            passed=False,
-            evidence="No downstream affected, cannot verify poison-free rerun.",
-        )
+def assert_rerun_poison_removed(report: TombstoneReport) -> AssertionResult:
+    """Re-run proves POISON is excluded from the rebuilt context.
+
+    Proof is on the INPUT side (deterministic, mode-independent). The DAG may
+    flag checkpoints that predate the poison seed; those are skipped. For each
+    genuinely-poisoned checkpoint: rebuilt context must not carry POISON and
+    the LLM must have answered. At least one must be proven.
+    """
+    affected = report.affected_downstream
     outcomes = report.rerun_outcomes
+    if not affected:
+        return AssertionResult(
+            name="rerun_poison_removed",
+            passed=False,
+            evidence="No affected downstream to re-run.",
+        )
     if not outcomes:
         return AssertionResult(
-            name="rerun_produces_poison_free_output",
+            name="rerun_poison_removed",
             passed=False,
             evidence="No rerun outcomes recorded.",
         )
-    # All affected downstream should have a rerun status indicating they were re-executed.
-    for cid in report.affected_downstream:
-        if cid not in outcomes:
-            return AssertionResult(
-                name="rerun_produces_poison_free_output",
-                passed=False,
-                evidence=f"Missing rerun outcome for affected checkpoint {cid}.",
+
+    bad: list[str] = []
+    skipped: list[str] = []
+    proven: list[str] = []
+    for cid in affected:
+        o = outcomes.get(cid, {})
+        if not o.get("raw_context_has_poison"):
+            skipped.append(cid)
+            continue
+        cid_bad: list[str] = []
+        if o.get("rebuilt_context_has_poison"):
+            cid_bad.append("rebuilt still contains POISON")
+        if not o.get("post_output"):
+            cid_bad.append("post_output empty (rerun did not execute)")
+        if cid_bad:
+            bad.append(f"{cid[:16]}: " + "; ".join(cid_bad))
+        else:
+            proven.append(
+                f"{cid[:16]}: rebuilt_has_poison={o.get('rebuilt_context_has_poison')} "
+                f"post_output_len={len(o.get('post_output', ''))}"
             )
+
+    if bad:
+        return AssertionResult(
+            name="rerun_poison_removed",
+            passed=False,
+            evidence="; ".join(bad),
+        )
+    if not proven:
+        return AssertionResult(
+            name="rerun_poison_removed",
+            passed=False,
+            evidence=f"Every affected checkpoint predated the poison seed "
+                     f"({len(skipped)} skipped); no genuinely-poisoned rerun was verified.",
+        )
     return AssertionResult(
-        name="rerun_produces_poison_free_output",
+        name="rerun_poison_removed",
         passed=True,
-        evidence=f"Rerun outcomes recorded for {len(report.affected_downstream)} affected checkpoints.",
+        evidence=f"{len(proven)} poisoned checkpoint(s) re-verified poison-free "
+                 f"({len(skipped)} pre-poison checkpoints skipped): "
+                 + " | ".join(proven[:4])
+                 + (f" ... +{len(proven)-4} more" if len(proven) > 4 else ""),
     )
 
 
@@ -176,13 +227,14 @@ def demo_A2_A3_interop(
         _predicate,
         rerun_downstream=True,
         actor="a2a3-interop",
+        rerun_fn=lambda cid, tid: _rerun_checkpoint(harness, tid, cid),
     )
 
     # (1) digest identified as affected (poisoned raw is inside digest range).
     assertions.append(assert_digest_identified_as_affected(store, provenance, thread_id, poisoned_id))
 
     # (2) re-run produces poison-free output.
-    assertions.append(assert_rerun_produces_poison_free_output(report, poisoned_id))
+    assertions.append(assert_rerun_poison_removed(report))
 
     passed = all(a.passed for a in assertions)
     metrics = {

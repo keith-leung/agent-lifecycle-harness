@@ -190,14 +190,21 @@ def assert_same_thread_writers_serialize(
     h: LifecycleHarness,
     thread_id: str,
 ) -> AssertionResult:
-    """(d) Two concurrent writers to the SAME thread serialize without torn writes."""
+    """(d) Two concurrent writers to the SAME thread serialize without torn writes.
+
+    Timeouts are sized for real-LLM latency (each writer makes one live model
+    call; under a remote provider a single invoke can take tens of seconds).
+    The 15s budget that passes in mock mode is too tight for real mode and
+    produces a false "did not complete" failure that has nothing to do with
+    serialization correctness.
+    """
     barrier = threading.Barrier(2)
     errors: list[BaseException] = []
     results: list[dict[str, Any]] = [None, None]  # type: ignore[list-item]
 
     def _writer(idx: int, msg: str) -> None:
         try:
-            barrier.wait(timeout=10)
+            barrier.wait(timeout=30)
             results[idx] = h.invoke(thread_id, msg)
         except BaseException as exc:  # noqa: BLE001
             errors.append(exc)
@@ -206,8 +213,8 @@ def assert_same_thread_writers_serialize(
     t2 = threading.Thread(target=_writer, args=(1, "writer-b: world"))
     t1.start()
     t2.start()
-    t1.join(timeout=15)
-    t2.join(timeout=15)
+    t1.join(timeout=120)
+    t2.join(timeout=120)
 
     if errors:
         return AssertionResult(

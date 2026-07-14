@@ -18,7 +18,7 @@ def test_a2a3_interop_all_assertions_pass_mock():
     names = {a.name for a in result.assertions}
     expected = {
         "digest_identified_as_affected",
-        "rerun_produces_poison_free_output",
+        "rerun_poison_removed",
     }
     assert names == expected, f"Missing or extra assertions: {names ^ expected}"
     for a in result.assertions:

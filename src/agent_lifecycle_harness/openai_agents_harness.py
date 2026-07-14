@@ -160,16 +160,30 @@ def assert_oai_run_config_hot_reload() -> AssertionResult:
     """
     try:
         from agents import RunConfig, SessionSettings
+        from agents.memory import SQLiteSession
 
-        assert RunConfig is not None
-        assert SessionSettings is not None
-        # Verify we can instantiate with minimal args
-        _ = RunConfig(model=None)
+        # Verify we can instantiate RunConfig with request-scoped metadata
+        # and that SessionSettings can be attached.
+        run_config = RunConfig(
+            model=None,
+            workflow_name="hot-reload-test",
+            trace_metadata={"version": "v1", "session": "s1"},
+        )
+        assert run_config.workflow_name == "hot-reload-test"
+        assert run_config.trace_metadata.get("version") == "v1"
+
+        # Verify SessionSettings exists and is attachable to RunConfig.
+        settings = SessionSettings()
+        run_config_with_settings = RunConfig(
+            model=None,
+            session_settings=settings,
+        )
+        assert run_config_with_settings.session_settings is not None
     except Exception as exc:
         return AssertionResult(
             name="oai_run_config_hot_reload",
             passed=False,
-            evidence=f"OAI SDK RunConfig import/instantiate failed: {exc}",
+            evidence=f"OAI SDK RunConfig/SessionSettings test raised: {exc}",
         )
     return AssertionResult(
         name="oai_run_config_hot_reload",
@@ -189,21 +203,19 @@ def assert_oai_run_metrics() -> AssertionResult:
     monitoring. Lightweight judge scoring is app-owned.
     """
     try:
-        from agents import (
-            RunConfig,
-            HandoffInputFilter,
-            default_handoff_history_mapper,
-        )
+        from agents import Usage, TurnSpanData
 
-        assert RunConfig is not None
-        # Verify these symbols exist; we don't need to instantiate all of them.
-        assert HandoffInputFilter is not None
-        assert default_handoff_history_mapper is not None
+        # Verify run metrics primitives exist and can carry trace data.
+        usage = Usage()
+        turn_span = TurnSpanData(turn=1, agent_name="test-agent")
+        assert turn_span.turn == 1
+        assert turn_span.agent_name == "test-agent"
+        assert turn_span.usage is None or isinstance(turn_span.usage, dict)
     except Exception as exc:
         return AssertionResult(
             name="oai_run_metrics",
             passed=False,
-            evidence=f"OAI SDK metrics import failed: {exc}",
+            evidence=f"OAI SDK metrics test raised: {exc}",
         )
     return AssertionResult(
         name="oai_run_metrics",
@@ -213,32 +225,49 @@ def assert_oai_run_metrics() -> AssertionResult:
 
 
 # ---------------------------------------------------------------------------
-# A6 OAI SDK: Migration — real import verification
+# A6 OAI SDK: Migration — honest: schema migration is app-owned on BOTH
 # ---------------------------------------------------------------------------
 
-def assert_oai_schema_versioning() -> AssertionResult:
-    """A6 OAI-side: run schema versioning + migration is framework-given.
+def assert_oai_schema_migration_app_owned() -> AssertionResult:
+    """A6 OAI-side: the SDK ships NO state-schema migration; A6 is app-owned
+    on both frameworks.
 
-    OAI SDK provides schema versioning for runs. Migration functions
-    are app-owned.
+    Earlier this cell wrote ``{"schema_version": "v2"}`` into
+    ``RunConfig.trace_metadata`` and claimed that proved "framework-given
+    schema versioning." That was false: ``trace_metadata`` is an arbitrary
+    user-supplied dict (an attach-case for whatever the app wants to tag a
+    run with), not a versioning/migration API. Writing a key called
+    ``schema_version`` into it proves nothing the SDK does for you.
+
+    What the SDK genuinely provides here: the ``RunConfig`` symbol and its
+    ``trace_metadata`` slot exist as real, constructible objects (proven by
+    import + construct below). Carrying a schema tag through them is
+    application behavior, not framework behavior. State-schema migration is
+    therefore app-owned on both LangGraph and the OAI SDK, exactly as A6's
+    app-owned migrator (``migration.py``) demonstrates.
     """
     try:
         from agents import RunConfig
-        from pydantic import BaseModel
 
-        # Verify schema versioning primitives exist in the SDK.
-        assert RunConfig is not None
-        assert BaseModel is not None
+        # Real symbol, real object — the only thing the SDK gives us here.
+        run_config = RunConfig(model=None, trace_metadata={})
+        assert run_config.trace_metadata is not None
+        # trace_metadata is an arbitrary dict: the app can put any key in it,
+        # but the SDK neither interprets nor versions it.
+        run_config.trace_metadata["schema_version"] = "v2"
+        assert run_config.trace_metadata.get("schema_version") == "v2"
     except Exception as exc:
         return AssertionResult(
-            name="oai_schema_versioning",
+            name="oai_schema_migration_app_owned",
             passed=False,
-            evidence=f"OAI SDK schema versioning import failed: {exc}",
+            evidence=f"OAI SDK RunConfig construction raised: {exc}",
         )
     return AssertionResult(
-        name="oai_schema_versioning",
+        name="oai_schema_migration_app_owned",
         passed=True,
-        evidence="OAI SDK run schema versioning is framework-given (migration fn is app-owned).",
+        evidence="OAI SDK ships no state-schema migration; RunConfig.trace_metadata "
+                 "is arbitrary app metadata, not a versioning API. A6 (schema registry "
+                 "+ migration fn) is app-owned on BOTH frameworks.",
     )
 
 

@@ -18,7 +18,7 @@ from agent_lifecycle_harness.openai_agents_harness import (
     assert_oai_pop_item_removes_provenance,
     assert_oai_run_config_hot_reload,
     assert_oai_run_metrics,
-    assert_oai_schema_versioning,
+    assert_oai_schema_migration_app_owned,
     assert_oai_session_isolation,
 )
 
@@ -87,12 +87,12 @@ CROSS_FRAMEWORK_MATRIX: dict[str, dict[str, Any]] = {
     },
     "A6": {
         "langgraph_concept": "state schema registry + migration fn",
-        "oai_sdk_equivalent": "run schema versioning (framework-given)",
+        "oai_sdk_equivalent": "none (app-owned migration; trace_metadata is arbitrary metadata, not a versioning API)",
         "app_layer_boundary": "SchemaRegistry",
-        "framework_owned": "serialized state blob",
-        "app_owned": "schema + migration fn (both LG and OAI)",
-        "oai_implementation": "assert_oai_schema_versioning",
-        "oai_citation": "openai.agents.Schema versioning (OAI SDK docs)",
+        "framework_owned": "RunConfig.trace_metadata slot exists (arbitrary user dict)",
+        "app_owned": "schema registry + migration fn (BOTH LG and OAI)",
+        "oai_implementation": "assert_oai_schema_migration_app_owned",
+        "oai_citation": "agents.RunConfig.trace_metadata (arbitrary metadata, NOT a versioning API)",
     },
 }
 
@@ -170,7 +170,7 @@ def demo_A7_cross_framework(harness: Any = None) -> DemoResult:
     assertions.append(assert_oai_pop_item_removes_provenance())
     assertions.append(assert_oai_run_config_hot_reload())
     assertions.append(assert_oai_run_metrics())
-    assertions.append(assert_oai_schema_versioning())
+    assertions.append(assert_oai_schema_migration_app_owned())
 
     passed = all(a.passed for a in assertions)
     metrics = {
