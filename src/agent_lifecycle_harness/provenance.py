@@ -75,13 +75,34 @@ class ProvenanceStore:
     def get_provenance(self, checkpoint_id: str) -> ProvenanceRecord | None:
         if self._mock_mode:
             return self._memory_provenance.get(checkpoint_id)
-        # We don't know thread_id here; scan all namespaces.
-        raise NotImplementedError("BaseStore listing not implemented in this prototype")
+        # Search across all provenance namespaces for this checkpoint_id.
+        # BaseStore.search is namespace-scoped; without a thread_id we cannot
+        # target one namespace, so this requires a linear scan of known threads.
+        # In practice callers always have thread_id and use list_provenance_by_thread.
+        # Fall back to scanning the single namespace if only one thread is active.
+        raise NotImplementedError(
+            "get_provenance without thread_id is not supported on BaseStore; "
+            "use list_provenance_by_thread(thread_id) and filter."
+        )
 
     def list_provenance_by_thread(self, thread_id: str) -> list[ProvenanceRecord]:
         if self._mock_mode:
             return [r for r in self._memory_provenance.values() if r.thread_id == thread_id]
-        raise NotImplementedError("BaseStore listing not implemented in this prototype")
+        ns = self._namespace(thread_id)
+        items = self._store.search(ns)
+        out: list[ProvenanceRecord] = []
+        for item in items:
+            v = item.value
+            out.append(ProvenanceRecord(
+                checkpoint_id=v.get("checkpoint_id", item.key),
+                thread_id=v.get("thread_id", thread_id),
+                parent_ids=json.loads(v.get("parent_ids", "[]")),
+                produced_by=v.get("produced_by", ""),
+                produced_at=v.get("produced_at", ""),
+                sha256=v.get("sha256", ""),
+                metadata=json.loads(v.get("metadata", "{}")) if v.get("metadata") else {},
+            ))
+        return out
 
     def put_tombstone(self, record: TombstoneRecord) -> None:
         if self._mock_mode:
@@ -107,12 +128,33 @@ class ProvenanceStore:
     def get_tombstone(self, checkpoint_id: str) -> TombstoneRecord | None:
         if self._mock_mode:
             return self._memory_tombstones.get(checkpoint_id)
-        raise NotImplementedError("BaseStore listing not implemented in this prototype")
+        # Tombstones are namespaced by thread; without thread_id we scan.
+        raise NotImplementedError(
+            "get_tombstone without thread_id is not supported on BaseStore; "
+            "use list_tombstones_by_thread(thread_id) and filter."
+        )
 
     def list_tombstones_by_thread(self, thread_id: str) -> list[TombstoneRecord]:
         if self._mock_mode:
             return [r for r in self._memory_tombstones.values() if r.thread_id == thread_id]
-        raise NotImplementedError("BaseStore listing not implemented in this prototype")
+        ns = self._namespace(thread_id)
+        items = self._store.search(ns)
+        out: list[TombstoneRecord] = []
+        for item in items:
+            v = item.value
+            if v.get("type") != "tombstone":
+                continue
+            out.append(TombstoneRecord(
+                checkpoint_id=v.get("checkpoint_id", item.key),
+                thread_id=v.get("thread_id", thread_id),
+                reason=v.get("reason", ""),
+                actor=v.get("actor", ""),
+                ts=v.get("ts", ""),
+                affected_downstream=json.loads(v.get("affected_downstream", "[]")),
+                rerun_outcomes=json.loads(v.get("rerun_outcomes", "{}")) if v.get("rerun_outcomes") else {},
+                metadata=json.loads(v.get("metadata", "{}")) if v.get("metadata") else {},
+            ))
+        return out
 
     def is_tombstoned(self, checkpoint_id: str) -> bool:
         return self.get_tombstone(checkpoint_id) is not None

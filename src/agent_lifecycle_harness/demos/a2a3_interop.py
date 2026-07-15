@@ -53,12 +53,10 @@ def _build_provenance_for_thread(
 ) -> ProvenanceStore:
     """Build a provenance DAG from an existing thread's checkpoint history.
 
-    Only include checkpoints that contain at least one assistant message,
-    so the DAG represents complete turns rather than intermediate snapshots.
+    Collapse each turn (identified by message count) to its final ai
+    checkpoint, so the DAG has one node per turn with a clean parent chain.
     """
     store = ProvenanceStore(base_store=None)
-    # list_checkpoints returns reverse-chronological (newest first).
-    # Reverse to chronological so parent = older checkpoint, child = newer.
     raw_checkpoints = list(reversed(harness.list_checkpoints(thread_id)))
 
     def _has_assistant(cp: dict[str, Any]) -> bool:
@@ -69,9 +67,18 @@ def _build_provenance_for_thread(
         role = getattr(last, "type", getattr(last, "role", ""))
         return role in ("assistant", "ai")
 
-    checkpoints = [cp for cp in raw_checkpoints if _has_assistant(cp)]
+    def _nmsg(cp: dict[str, Any]) -> int:
+        return len(cp.get("values", {}).get("messages", []))
+
+    by_turn: dict[int, dict[str, Any]] = {}
+    for cp in raw_checkpoints:
+        if not _has_assistant(cp):
+            continue
+        by_turn[_nmsg(cp)] = cp
+
+    turns = sorted(by_turn.values(), key=_nmsg)
     parent_ids: list[str] = []
-    for i, cp in enumerate(checkpoints):
+    for i, cp in enumerate(turns):
         cp_id = cp.get("checkpoint_id") or f"{thread_id}-cp-{i}"
         raw_content = str(cp.get("values", {}))
         record = build_provenance_record(

@@ -22,6 +22,11 @@ from openai import APIStatusError, AsyncOpenAI, OpenAI
 from agent_lifecycle_harness.config import is_mock_mode, provider_config
 from agent_lifecycle_harness.debug_log import log_llm_call, log_balance_error
 
+# Cap on how much input the mock echoes back verbatim. Without this, multi-turn
+# mock runs grow exponentially (each reply echoes all prior history including
+# prior replies), risking SQLite blob bloat in the checkpoint table.
+_ECHO_MAX_CHARS = 4000
+
 
 @dataclass
 class LLMResponse:
@@ -256,9 +261,21 @@ class MockLLMClient(LLMClient):
         self.model = f"{provider_name}-{tier}"
 
     def _derive_content(self, messages: Sequence[Any]) -> str:
-        """Echo transform applied uniformly to every input (no sentinel special-casing)."""
+        """Echo transform applied uniformly to every input (no sentinel special-casing).
+
+        The echoed input is capped at _ECHO_MAX_CHARS so multi-turn mock runs
+        don't produce exponentially-growing replies (each turn's reply echoes
+        all prior history, including prior replies). The cap preserves the
+        head of the input — where seeded sentinels like POISON live — so
+        content-derived proof models still hold; only the tail (which is
+        prior echo bloat) is dropped.
+        """
         input_text = "".join(_message_content(m) for m in messages)
-        short_hash = hashlib.sha256(input_text.encode()).hexdigest()[:8]
+        if len(input_text) > _ECHO_MAX_CHARS:
+            input_text = input_text[:_ECHO_MAX_CHARS] + "...[echo-truncated]"
+        short_hash = hashlib.sha256(
+            "".join(_message_content(m) for m in messages).encode()
+        ).hexdigest()[:8]
         label = f"MOCK-{self.provider_name}-{self.prefix}" if self.prefix else f"MOCK-{self.provider_name}"
         return f"[{label}] echo: {input_text} | sha={short_hash}"
 
