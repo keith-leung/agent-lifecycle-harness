@@ -153,26 +153,27 @@ def assert_oai_pop_item_removes_provenance() -> AssertionResult:
 # ---------------------------------------------------------------------------
 
 def assert_oai_run_config_hot_reload() -> AssertionResult:
-    """A4 OAI-side: request-scoped RunConfig is framework-given hot-reload.
+    """A4 OAI-side: RunConfig/SessionSettings symbols exist and construct.
 
-    OAI SDK provides RunConfig for per-request configuration, enabling
-    hot-reload without app-layer version tracking.
+    This cell proves ONLY that the OAI SDK ships RunConfig + SessionSettings
+    as real, constructible objects whose set fields round-trip. It does NOT
+    prove a hot-reload mechanism — the version-on-session logic (bind config
+    version to session, old sessions unaffected by reload) is application-
+    owned on BOTH frameworks. The OAI SDK gives the request-scoped config
+    object; the app decides how to version and reload.
     """
     try:
         from agents import RunConfig, SessionSettings
-        from agents.memory import SQLiteSession
 
-        # Verify we can instantiate RunConfig with request-scoped metadata
-        # and that SessionSettings can be attached.
         run_config = RunConfig(
             model=None,
             workflow_name="hot-reload-test",
             trace_metadata={"version": "v1", "session": "s1"},
         )
+        # Round-trip: values set at construction are readable back.
         assert run_config.workflow_name == "hot-reload-test"
         assert run_config.trace_metadata.get("version") == "v1"
 
-        # Verify SessionSettings exists and is attachable to RunConfig.
         settings = SessionSettings()
         run_config_with_settings = RunConfig(
             model=None,
@@ -183,12 +184,14 @@ def assert_oai_run_config_hot_reload() -> AssertionResult:
         return AssertionResult(
             name="oai_run_config_hot_reload",
             passed=False,
-            evidence=f"OAI SDK RunConfig/SessionSettings test raised: {exc}",
+            evidence=f"OAI SDK RunConfig/SessionSettings construction raised: {exc}",
         )
     return AssertionResult(
         name="oai_run_config_hot_reload",
         passed=True,
-        evidence="OAI SDK RunConfig provides framework-given request-scoped hot-reload (LG side is app-owned).",
+        evidence="OAI SDK RunConfig + SessionSettings symbols exist and construct "
+                 "(fields round-trip). Hot-reload version-on-session logic is "
+                 "app-owned on BOTH frameworks.",
     )
 
 
@@ -197,30 +200,36 @@ def assert_oai_run_config_hot_reload() -> AssertionResult:
 # ---------------------------------------------------------------------------
 
 def assert_oai_run_metrics() -> AssertionResult:
-    """A5 OAI-side: run metrics + alerting hooks are framework-given.
+    """A5 OAI-side: Usage/TurnSpanData symbols exist, construct, and round-trip.
 
-    OAI SDK emits run-level metrics that can be used for degradation
-    monitoring. Lightweight judge scoring is app-owned.
+    This cell proves ONLY that the OAI SDK ships Usage + TurnSpanData as real,
+    constructible objects whose set fields are readable back. It does NOT
+    prove a degradation-monitoring mechanism — sustained-delta detection +
+    mitigation is application-owned on BOTH frameworks.
     """
     try:
         from agents import Usage, TurnSpanData
 
-        # Verify run metrics primitives exist and can carry trace data.
         usage = Usage()
-        turn_span = TurnSpanData(turn=1, agent_name="test-agent")
-        assert turn_span.turn == 1
-        assert turn_span.agent_name == "test-agent"
-        assert turn_span.usage is None or isinstance(turn_span.usage, dict)
+        turn_span = TurnSpanData(turn=3, agent_name="metrics-test-agent")
+        # Meaningful round-trip: the values we set are the values we read back.
+        assert turn_span.turn == 3, f"turn round-trip failed: {turn_span.turn}"
+        assert turn_span.agent_name == "metrics-test-agent", f"agent_name round-trip failed: {turn_span.agent_name}"
+        # Verify Usage is a real object we can inspect (not just importable).
+        assert hasattr(usage, "input_tokens") or hasattr(usage, "requests"), \
+            "Usage object has no expected metric fields"
     except Exception as exc:
         return AssertionResult(
             name="oai_run_metrics",
             passed=False,
-            evidence=f"OAI SDK metrics test raised: {exc}",
+            evidence=f"OAI SDK Usage/TurnSpanData construction raised: {exc}",
         )
     return AssertionResult(
         name="oai_run_metrics",
         passed=True,
-        evidence="OAI SDK run metrics provide framework-given execution trace (degradation monitor is app-owned).",
+        evidence="OAI SDK Usage + TurnSpanData symbols exist, construct, and "
+                 "round-trip set fields. Degradation monitoring (sustained-delta "
+                 "detection + mitigation) is app-owned on BOTH frameworks.",
     )
 
 
@@ -274,21 +283,7 @@ def assert_oai_schema_migration_app_owned() -> AssertionResult:
 # ---------------------------------------------------------------------------
 # Demo entrypoint
 # ---------------------------------------------------------------------------
+# The live A7 entrypoint is demos/a7_cross_framework.py:demo_A7_cross_framework,
+# which imports the individual assert_* functions from this module. There is
+# no standalone demo function here — run.py dispatches the cross_framework one.
 
-def demo_A7_openai_agents() -> DemoResult:
-    """Run the A7 OpenAI Agents SDK cross-framework scenario."""
-    assertions: list[AssertionResult] = []
-
-    assertions.append(assert_oai_session_isolation())
-    assertions.append(assert_oai_compaction_framework_given())
-    assertions.append(assert_oai_pop_item_removes_provenance())
-    assertions.append(assert_oai_run_config_hot_reload())
-    assertions.append(assert_oai_run_metrics())
-    assertions.append(assert_oai_schema_versioning())
-
-    passed = all(a.passed for a in assertions)
-    metrics = {
-        "framework": "openai-agents-sdk",
-        "cells": len(assertions),
-    }
-    return DemoResult(name="A7_openai_agents", passed=passed, assertions=assertions, metrics=metrics)
