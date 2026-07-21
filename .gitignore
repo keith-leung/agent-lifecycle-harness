@@ -67,3 +67,14 @@ WORK_ORDER*.md
 *HANG_FIX*.md
 SPEC_GAP.md
 HANDOFF.md
+DEEP_DIVE_A.md
+
+# --- Study / audit notes (NEVER publish) ---
+# These are the owner's own study notes and weakness audits. They document
+# design debt, wiring gaps, and interview risks in this repo's own code.
+# They belong outside the repo entirely; this entry is a backstop against
+# an accidental `git add .` before the move is done.
+RUNTIME_NOTES*.md
+STUDY_NOTES*.md
+NOTES*.md
+notes/

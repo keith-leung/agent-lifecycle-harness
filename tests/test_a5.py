@@ -20,23 +20,28 @@ def test_a5_all_assertions_pass_mock():
         "degradation_detected",
         "control_no_false_positive",
         "trend_based",
-        "mitigation_hook_fires",
+        "exactly_one_alert",
+        "mitigation_hook_fires_once",
+        "scores_from_judge",
     }
     assert names == expected, f"Missing or extra assertions: {names ^ expected}"
     for a in result.assertions:
         assert a.passed is True, a.evidence
 
 
-def test_a5_fixture_sequences():
+def test_a5_judge_fed_and_edge_triggered():
     result = demo_A5_degradation()
     metrics = result.metrics
     assert metrics["delta_threshold"] == 0.05
     assert metrics["min_sustained"] == 3
-    fixtures = metrics["fixture_sequences"]
-    assert fixtures["degrading"] == [0.9] * 10 + [0.5] * 10
-    assert fixtures["stable"] == [0.9] * 20
-    assert fixtures["single_dip"] == [0.9, 0.9, 0.9, 0.9, 0.5, 0.9, 0.9, 0.9, 0.9, 0.9]
-    assert metrics["framework"] == "langgraph"
+    # Judge-fed: scores came from judge.score() calls.
+    assert metrics["judge"] == "MockJudge"
+    assert metrics["judge_score_calls"] > 0
+    # Edge-triggered: one degradation event → one alert + one hook call.
+    assert metrics["alerts_on_degrading_fixture"] == 1
+    assert metrics["mitigation_hook_calls"] == 1
+    # No fake framework label.
+    assert "framework" not in metrics
 
 
 def _format_failures(result: DemoResult) -> str:

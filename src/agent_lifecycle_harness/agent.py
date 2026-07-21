@@ -12,46 +12,64 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, MessagesState, StateGraph
 
-from agent_lifecycle_harness.llm import LLMClient, LLMResponse
-from agent_lifecycle_harness.compaction import CompactionStore, CheckpointCompactor
+from agent_lifecycle_harness.llm import LLMClient, LLMResponse, build_chat_model
+from agent_lifecycle_harness.compaction import (
+    CompactionStore,
+    CompactionStrategy,
+    DigestCompactionStrategy,
+    LangmemCompactor,
+    NoCompactionStrategy,
+)
 
 
-def _build_graph(llm_client: LLMClient, compaction_store: Any | None = None) -> StateGraph:
-    """Minimal single-node agent graph for lifecycle experiments."""
+def _build_graph(
+    llm_client: LLMClient,
+    compaction_strategy: CompactionStrategy | None = None,
+    model_registry: dict[str, LLMClient] | None = None,
+) -> StateGraph:
+    """Minimal single-node agent graph for lifecycle experiments.
+
+    The node is strategy-agnostic: it asks the configured
+    ``CompactionStrategy`` what the LLM should see, then forwards that. All
+    policy (no-compaction / digest / future strategies) lives behind the
+    strategy interface, so adding a policy never edits this node.
+
+    ``model_registry`` enables per-invoke client selection: if a caller
+    puts ``model`` in ``config["configurable"]``, the node looks up the
+    matching LLMClient in the registry and invokes THAT instead of the
+    fixed ``llm_client``. This is what makes A4's resolved config actually
+    reach the LLM — flipping the resolved model flips the client that
+    answers. A missing model key falls back to the fixed client so demos
+    that don't pass a model (A1/A3/A6/...) behave identically to before.
+    """
+
+    strategy = compaction_strategy or NoCompactionStrategy()
+    registry = model_registry or {}
 
     def _call_model(state: MessagesState, config: RunnableConfig) -> dict[str, Any]:
         messages = state["messages"]
-        
-        # Read compaction digests from the store inside the graph node.
-        # This makes compaction a first-class graph concern rather than a
-        # harness-layer side effect.
-        prefix = ""
-        if compaction_store is not None:
-            thread_id = config.get("configurable", {}).get("thread_id", "")
-            digests = compaction_store.digests_for_thread(thread_id)
-            if digests:
-                digest_text = "\n".join(
-                    f"[DIGEST {d.digest_id}]: {d.summary}" for d in digests
-                )
-                prefix = f"Context digests:\n{digest_text}\n\n"
-        
-        # Some providers (e.g. MiMo) reject `role: system`. Strip it here.
+
+        # Some providers (e.g. MiMo) reject `role: system`. Strip system
+        # messages before strategy rewrite so a synthesized digest message
+        # (role: user) survives, but genuine system prompts don't 422.
         filtered = []
         for m in messages:
             role = getattr(m, "type", None) or getattr(m, "role", None)
             if role == "system":
                 continue
             filtered.append(m)
-        
-        # Inject digest context into the first message if present.
-        if prefix and filtered:
-            first = filtered[0]
-            if hasattr(first, "content"):
-                first.content = f"{prefix}{first.content}"
-            elif isinstance(first, dict):
-                first["content"] = f"{prefix}{first.get('content', '')}"
-        
-        response: LLMResponse = llm_client.invoke_sync(filtered)
+
+        # Strategy decides what the LLM sees (architecture C for digest).
+        thread_id = config.get("configurable", {}).get("thread_id", "")
+        decision = strategy.build_replay_context(thread_id, filtered)
+
+        # Per-invoke client selection (A4): if the caller pinned a model via
+        # config["configurable"]["model"], use the registered client for it.
+        # Otherwise fall through to the harness's default fixed client.
+        pinned_model = config.get("configurable", {}).get("model")
+        active_client = registry.get(pinned_model, llm_client) if pinned_model else llm_client
+
+        response: LLMResponse = active_client.invoke_sync(decision.messages)
         return {"messages": [AIMessage(content=response.content)]}
 
     builder = StateGraph(MessagesState)
@@ -77,32 +95,82 @@ class LifecycleHarness:
         *,
         framework: str = "langgraph",
         compaction_store: Any | None = None,
-        compaction_threshold: int = 0,
+        compaction_strategy: CompactionStrategy | None = None,
+        summarization_chat_model: Any | None = None,
+        max_tokens: int = 384,
+        max_tokens_before_summary: int | None = None,
+        max_summary_tokens: int = 200,
+        model_registry: dict[str, LLMClient] | None = None,
     ) -> None:
         self.db_path = Path(db_path)
         self.llm = llm
         self.judge = judge
         self.framework = framework
-        self.compaction_store = compaction_store
-        self.compaction_threshold = compaction_threshold
-        conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
-        self._graph = _build_graph(llm, self.compaction_store).compile(
-            checkpointer=SqliteSaver(conn)
-        )
+        # Expose the summarization chat model so demos can build their own
+        # LangmemCompactor against the same model the harness would use.
+        self.summarization_chat_model = summarization_chat_model
+        # Per-invoke model→client registry (A4). When a caller pins a model
+        # via invoke(resolved_config=...), the node uses the registered
+        # client for that model instead of the fixed default `llm`. Empty
+        # by default → no per-invoke selection → backward compatible.
+        self.model_registry: dict[str, LLMClient] = dict(model_registry or {})
         # Per-thread serialization locks (same-thread writers serialize).
         self._thread_locks: dict[str, threading.Lock] = {}
         self._global_lock = threading.Lock()
 
-        # Auto-compaction infrastructure: if threshold > 0, create a
-        # CompactionStore backed by the same DB and a CheckpointCompactor
-        # that uses the judge for digest generation.
-        if self.compaction_threshold > 0 and self.compaction_store is None:
-            self.compaction_store = CompactionStore(self.db_path)
-            self._compactor = CheckpointCompactor(
-                self.compaction_store, self.judge, first_last_n=3
+        # Compaction persistence (shared SQLite table, separate from LG's
+        # checkpoint table). All CompactionStore instances at the same
+        # db_path see the same rows.
+        self.compaction_store = compaction_store or CompactionStore(self.db_path)
+
+        # Strategy selection (§6.1):
+        #   * caller-provided strategy → use as-is (full control)
+        #   * summarization_chat_model available → DigestCompactionStrategy
+        #     backed by a LangmemCompactor engine (architecture C, real
+        #     folding)
+        #   * otherwise → NoCompactionStrategy (baseline; used in mock mode
+        #     without a real chat model, or when a caller wants the A/B
+        #     reference)
+        if compaction_strategy is not None:
+            self.compaction_strategy = compaction_strategy
+        elif summarization_chat_model is not None:
+            compactor = LangmemCompactor(
+                self.compaction_store,
+                summarization_chat_model,
+                max_tokens=max_tokens,
+                max_tokens_before_summary=max_tokens_before_summary,
+                max_summary_tokens=max_summary_tokens,
+            )
+            self.compaction_strategy = DigestCompactionStrategy(
+                compactor,
+                checkpoint_resolver=self._resolve_message_checkpoints,
             )
         else:
-            self._compactor = None
+            self.compaction_strategy = NoCompactionStrategy()
+
+        conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
+        self._graph = _build_graph(
+            llm, self.compaction_strategy, model_registry=self.model_registry
+        ).compile(
+            checkpointer=SqliteSaver(conn)
+        )
+
+    def _resolve_message_checkpoints(self, thread_id: str) -> dict[str, str | None]:
+        """Map every message id in the thread's latest state to the
+        checkpoint id that produced it. Feeds A3's DAG the
+        message↔checkpoint edge for compaction-aware tombstone traversal.
+        """
+        mapping: dict[str, str | None] = {}
+        for cp in self.list_checkpoints(thread_id):
+            cp_id = cp.get("checkpoint_id")
+            for m in cp.get("values", {}).get("messages", []):
+                mid = getattr(m, "id", None) or (
+                    m.get("id") if isinstance(m, dict) else None
+                )
+                if mid:
+                    # Later checkpoints win (most recent producing cp).
+                    mapping[mid] = cp_id
+        return mapping
 
     def _thread_lock(self, thread_id: str) -> threading.Lock:
         with self._global_lock:
@@ -133,25 +201,67 @@ class LifecycleHarness:
         *,
         config_version: str = "v1",
         truncate_after: int | None = None,
+        resolved_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Run one turn and return the full state snapshot."""
-        config = {"configurable": {"thread_id": thread_id}}
+        """Run one turn and return the full state snapshot.
+
+        `config_version` is stamped into every checkpoint produced by this
+        invoke via LangGraph's `config["metadata"]` channel, so it persists
+        across sessions and survives process restarts. Reading the state back
+        with `get_state()` recovers it from checkpoint metadata, not from an
+        in-memory field — that is what makes version-on-session observable
+        rather than asserted-only.
+
+        `resolved_config` (A4): the per-session resolved config dict. If it
+        carries a ``model`` key, that model name is forwarded into
+        ``config["configurable"]["model"]`` so the node picks the matching
+        registered LLMClient (see ``model_registry``). This is the wire that
+        makes a material config reload actually change the LLM answering the
+        session — without it the resolved model is just a tracker label.
+        """
+        configurable: dict[str, Any] = {"thread_id": thread_id}
+        if resolved_config is not None and "model" in resolved_config:
+            configurable["model"] = resolved_config["model"]
+        config: dict[str, Any] = {
+            "configurable": configurable,
+            # LangGraph persists config["metadata"] into each checkpoint's
+            # metadata blob, so config_version survives in SQLite.
+            "metadata": {"config_version": config_version},
+        }
         inputs = self._build_inputs(thread_id, user_msg, truncate_after=truncate_after)
         # Same-thread writers serialize via per-thread lock.
         lock = self._thread_lock(thread_id)
-        with lock:
-            result = self._graph.invoke(inputs, config=config)
-        # Attach runtime metadata for downstream inspection.
+        import sys
+        import time as _time
+        import datetime as _dt
+        _t0 = _time.time()
+        # Heartbeat: if the invoke takes >30s, print a marker so the run
+        # doesn't look frozen. Real-LLM calls can legitimately take 20-60s
+        # under gateway load; this distinguishes "slow but working" from
+        # "hung" by emitting a line every 30s until the invoke returns.
+        import threading as _threading
+        _stop_hb = _threading.Event()
+        def _heartbeat():
+            i = 0
+            while not _stop_hb.wait(30):
+                i += 1
+                print(f"[{_dt.datetime.now().strftime('%H:%M:%S')}] "
+                      f"[heartbeat] invoke thread={thread_id!r} still running "
+                      f"({_t0 and int(_time.time()-_t0)}s elapsed)",
+                      file=sys.stderr, flush=True)
+        _hb = _threading.Thread(target=_heartbeat, daemon=True)
+        _hb.start()
+        try:
+            with lock:
+                result = self._graph.invoke(inputs, config=config)
+        finally:
+            _stop_hb.set()
+        # Attach runtime metadata for downstream inspection. The authoritative
+        # copy lives in checkpoint metadata (read back via get_state); the
+        # in-memory echo here is a convenience for the caller.
         result.setdefault("_harness_meta", {})
         result["_harness_meta"]["thread_id"] = thread_id
         result["_harness_meta"]["config_version"] = config_version
-
-        # Auto-compaction: if checkpoint count exceeds threshold, compact
-        # the middle segment into a digest entry.
-        if self.compaction_threshold > 0 and self._compactor is not None:
-            checkpoints = self.list_checkpoints(thread_id)
-            if len(checkpoints) > self.compaction_threshold:
-                self._compactor.compact(thread_id, checkpoints)
 
         return result
 
@@ -162,9 +272,14 @@ class LifecycleHarness:
             return None
         # Normalize into a plain dict for easier assertions.
         values = dict(state.values) if state.values else {}
+        # config_version is read back from checkpoint metadata — the same
+        # blob that was written by invoke()'s config["metadata"] channel.
+        # This is the persisted source of truth, not an in-memory echo.
+        meta = dict(getattr(state, "metadata", {}) or {})
         values["_harness_meta"] = {
             "thread_id": thread_id,
             "next": state.next,
+            "config_version": meta.get("config_version"),
         }
         return values
 
@@ -177,6 +292,7 @@ class LifecycleHarness:
             return []
         items: list[dict[str, Any]] = []
         for snap in history:
+            meta = dict(getattr(snap, "metadata", {}) or {})
             items.append(
                 {
                     "thread_id": thread_id,
@@ -185,6 +301,7 @@ class LifecycleHarness:
                     ).get("checkpoint_id"),
                     "next": getattr(snap, "next", []),
                     "values": getattr(snap, "values", {}),
+                    "config_version": meta.get("config_version"),
                 }
             )
         return items

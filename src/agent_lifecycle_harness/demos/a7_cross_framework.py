@@ -14,12 +14,15 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from agent_lifecycle_harness.openai_agents_harness import (
-    assert_oai_compaction_framework_given,
+    BehaviorCell,
+    DocCell,
     assert_oai_pop_item_removes_provenance,
-    assert_oai_run_config_hot_reload,
-    assert_oai_run_metrics,
-    assert_oai_schema_migration_app_owned,
     assert_oai_session_isolation,
+    assert_oai_turn_span_exports,
+    assert_oai_usage_accumulates,
+    doc_oai_compaction_framework_given,
+    doc_oai_run_config_hot_reload,
+    doc_oai_schema_migration_app_owned,
 )
 
 
@@ -39,15 +42,20 @@ class DemoResult:
 
 
 # Mapping of LangGraph concepts to OpenAI Agents SDK equivalents.
+# Each OAI-side cell is one of:
+#   * behavior cell (assert_* function, runs against installed SDK, mutation-verified)
+#   * doc cell (doc_* function, citation-only, NOT executed locally)
+# The previous "import X; assert X is not None" middle ground has been removed.
 CROSS_FRAMEWORK_MATRIX: dict[str, dict[str, Any]] = {
     "A1": {
         "langgraph_concept": "thread_id isolation + per-thread write lock",
-        "oai_sdk_equivalent": "Session + RunConfig (request-scoped reload)",
+        "oai_sdk_equivalent": "SQLiteSession (per-session row scoping via session_id)",
         "app_layer_boundary": "namespaced ids + write serialization",
         "framework_owned": "thread_id (LG) / Session (OAI)",
         "app_owned": "namespacing + locks",
-        "oai_implementation": "assert_oai_session_isolation",
-        "oai_citation": "openai.agents.Session (OAI SDK docs)",
+        "oai_cell_kind": "behavior",
+        "oai_cell": "assert_oai_session_isolation",
+        "oai_citation": "site-packages/agents/memory/sqlite_session.py:17 (SQLiteSession.add_items, per-session row scoping)",
     },
     "A2": {
         "langgraph_concept": "SqliteSaver checkpoint history + app-owned CompactionStore",
@@ -55,44 +63,49 @@ CROSS_FRAMEWORK_MATRIX: dict[str, dict[str, Any]] = {
         "app_layer_boundary": "first-N + last-N + middle-digest",
         "framework_owned": "checkpoint table (LG) / OpenAIResponsesCompactionSession (OAI)",
         "app_owned": "compaction policy + digest (LG only)",
-        "oai_implementation": "assert_oai_compaction_framework_given",
-        "oai_citation": "openai.agents.OpenAIResponsesCompactionSession (OAI SDK docs)",
+        "oai_cell_kind": "documented",
+        "oai_cell": "doc_oai_compaction_framework_given",
+        "oai_citation": "site-packages/agents/memory/openai_responses_compaction_session.py:78 (run_compaction needs real client)",
     },
     "A3": {
         "langgraph_concept": "BaseStore provenance + soft tombstone + DAG traversal",
-        "oai_sdk_equivalent": "Session.pop_item (removes provenance, no tombstone)",
+        "oai_sdk_equivalent": "Session.pop_item (DELETE...RETURNING, no tombstone)",
         "app_layer_boundary": "provenance DAG + audit log",
         "framework_owned": "opaque run records",
         "app_owned": "provenance + tombstone + rerun (both LG and OAI)",
-        "oai_implementation": "assert_oai_pop_item_removes_provenance",
-        "oai_citation": "openai.agents.Session.pop_item (OAI SDK docs)",
+        "oai_cell_kind": "behavior",
+        "oai_cell": "assert_oai_pop_item_removes_provenance",
+        "oai_citation": "site-packages/agents/memory/sqlite_session.py (SQLiteSession.pop_item, DELETE...RETURNING)",
     },
     "A4": {
         "langgraph_concept": "config-version tracker per thread_id",
-        "oai_sdk_equivalent": "RunConfig (request-scoped, framework-given)",
+        "oai_sdk_equivalent": "RunConfig (request-scoped config; no version/session binding)",
         "app_layer_boundary": "version tracker + session registration",
         "framework_owned": "thread_id / Session",
-        "app_owned": "config version mapping (LG only)",
-        "oai_implementation": "assert_oai_run_config_hot_reload",
-        "oai_citation": "openai.agents.RunConfig (OAI SDK docs)",
+        "app_owned": "config version mapping (BOTH LG and OAI)",
+        "oai_cell_kind": "documented",
+        "oai_cell": "doc_oai_run_config_hot_reload",
+        "oai_citation": "site-packages/agents/run_config.py:211 (RunConfig has no version field)",
     },
     "A5": {
         "langgraph_concept": "invoke instrumentation + threshold alerting",
-        "oai_sdk_equivalent": "run metrics + alerting hooks (framework-given)",
+        "oai_sdk_equivalent": "Usage.add + TurnSpanData.export (framework-given primitives)",
         "app_layer_boundary": "DegradationMonitor",
-        "framework_owned": "execution trace",
-        "app_owned": "metrics + alerts (both LG and OAI)",
-        "oai_implementation": "assert_oai_run_metrics",
-        "oai_citation": "openai.agents.Run metrics (OAI SDK docs)",
+        "framework_owned": "execution trace primitives (Usage, TurnSpanData)",
+        "app_owned": "sustained-delta detection + alerts (BOTH LG and OAI)",
+        "oai_cell_kind": "behavior",
+        "oai_cell": "assert_oai_usage_accumulates + assert_oai_turn_span_exports",
+        "oai_citation": "site-packages/agents/usage.py:102 (Usage.add), agents/tracing/span_data.py:98 (TurnSpanData.export)",
     },
     "A6": {
         "langgraph_concept": "state schema registry + migration fn",
-        "oai_sdk_equivalent": "none (app-owned migration; trace_metadata is arbitrary metadata, not a versioning API)",
+        "oai_sdk_equivalent": "none (app-owned migration)",
         "app_layer_boundary": "SchemaRegistry",
-        "framework_owned": "RunConfig.trace_metadata slot exists (arbitrary user dict)",
+        "framework_owned": "RunConfig.trace_metadata slot (arbitrary user dict)",
         "app_owned": "schema registry + migration fn (BOTH LG and OAI)",
-        "oai_implementation": "assert_oai_schema_migration_app_owned",
-        "oai_citation": "agents.RunConfig.trace_metadata (arbitrary metadata, NOT a versioning API)",
+        "oai_cell_kind": "documented",
+        "oai_cell": "doc_oai_schema_migration_app_owned",
+        "oai_citation": "site-packages/agents/run_config.py:211 (trace_metadata is arbitrary dict, not a versioning API)",
     },
 }
 
@@ -115,20 +128,33 @@ def assert_matrix_complete() -> AssertionResult:
 
 
 def assert_oai_cells_run_or_cited() -> AssertionResult:
-    """Each OAI-side cell either runs with assertion or is documented with citation."""
+    """Each OAI-side cell is classified behavior or documented (no third kind).
+
+    The previous "import-only" cell type is forbidden: every row must
+    declare ``oai_cell_kind`` as either ``behavior`` (runs an observable
+    assertion, mutation-verified) or ``documented`` (citation-only, not
+    executed locally).
+    """
     for key, row in CROSS_FRAMEWORK_MATRIX.items():
-        impl = row.get("oai_implementation")
+        kind = row.get("oai_cell_kind")
         citation = row.get("oai_citation")
-        if not impl and not citation:
+        cell = row.get("oai_cell")
+        if kind not in ("behavior", "documented"):
             return AssertionResult(
                 name="oai_cells_run_or_cited",
                 passed=False,
-                evidence=f"Row {key} missing both implementation and citation.",
+                evidence=f"Row {key} has invalid oai_cell_kind={kind!r}; must be behavior|documented.",
+            )
+        if not cell or not citation:
+            return AssertionResult(
+                name="oai_cells_run_or_cited",
+                passed=False,
+                evidence=f"Row {key} missing cell function or citation.",
             )
     return AssertionResult(
         name="oai_cells_run_or_cited",
         passed=True,
-        evidence="All OAI cells have implementation or citation.",
+        evidence="All OAI cells classified as behavior or documented; none is import-only.",
     )
 
 
@@ -155,26 +181,61 @@ def assert_app_layer_boundary_documented() -> AssertionResult:
 def demo_A7_cross_framework(harness: Any = None) -> DemoResult:
     """Run the A7 cross-framework lifecycle matrix scenario.
 
-    Runs OAI SDK implementations for each cell where available.
+    Behavior cells run against the installed OAI SDK and must pass.
+    Doc cells are citation-only (NOT executed) and do not count as passes.
     """
     assertions: list[AssertionResult] = []
+    behavior_cells: list[BehaviorCell] = []
+    doc_cells: list[DocCell] = []
 
-    # Matrix structure check
+    # Matrix structure checks
     assertions.append(assert_matrix_complete())
     assertions.append(assert_oai_cells_run_or_cited())
     assertions.append(assert_app_layer_boundary_documented())
 
-    # Run OAI SDK implementations
-    assertions.append(assert_oai_session_isolation())
-    assertions.append(assert_oai_compaction_framework_given())
-    assertions.append(assert_oai_pop_item_removes_provenance())
-    assertions.append(assert_oai_run_config_hot_reload())
-    assertions.append(assert_oai_run_metrics())
-    assertions.append(assert_oai_schema_migration_app_owned())
+    # Behavior cells — actually run, must pass.
+    behavior_cells.append(assert_oai_session_isolation())
+    behavior_cells.append(assert_oai_pop_item_removes_provenance())
+    behavior_cells.append(assert_oai_usage_accumulates())
+    behavior_cells.append(assert_oai_turn_span_exports())
 
-    passed = all(a.passed for a in assertions)
+    # Doc cells — citation-only. Not executed, do NOT count as passes.
+    doc_cells.append(doc_oai_compaction_framework_given())
+    doc_cells.append(doc_oai_run_config_hot_reload())
+    doc_cells.append(doc_oai_schema_migration_app_owned())
+
+    # Surface behavior cells as assertion rows (these drive overall PASS).
+    for b in behavior_cells:
+        assertions.append(AssertionResult(
+            name=b.name, passed=b.passed, evidence=f"[behavior] {b.evidence}",
+        ))
+    # Surface doc cells as informational rows. These are NOT passing tests —
+    # we set passed=True so the demo's overall PASS (driven by behavior cells
+    # + structural checks) is not held hostage by documentation rows, but
+    # the evidence explicitly marks them as not-executed citations.
+    for d in doc_cells:
+        assertions.append(AssertionResult(
+            name=d.name, passed=True,
+            evidence=f"[documented, not executed] {d.note} | citation: {d.citation}",
+        ))
+
+    # Overall PASS = behavior cells all passed + structural checks passed.
+    # Doc cells are informational; they don't gate PASS because they're not tests.
+    behavior_passed = all(b.passed for b in behavior_cells)
+    structural_passed = all(a.passed for a in assertions[:3])  # matrix_complete / cells_run_or_cited / boundary
+    passed = behavior_passed and structural_passed
+
     metrics = {
         "matrix_entries": len(CROSS_FRAMEWORK_MATRIX),
-        "framework": "cross-framework",
+        "behavior_cells": len(behavior_cells),
+        "behavior_cells_passed": sum(1 for b in behavior_cells if b.passed),
+        "doc_cells": len(doc_cells),
+        "doc_cells_executed": sum(1 for d in doc_cells if d.executed),
+        "mutation_verified_cells": [
+            "oai_session_isolation (shared_db mutation)",
+            "oai_pop_item_removes_provenance (broken_pop mutation)",
+            "oai_usage_accumulates (broken_add mutation)",
+            "oai_turn_span_exports (broken_export mutation)",
+        ],
     }
     return DemoResult(name="A7_cross_framework", passed=passed, assertions=assertions, metrics=metrics)
